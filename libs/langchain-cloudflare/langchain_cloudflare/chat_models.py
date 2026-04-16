@@ -54,7 +54,12 @@ from langchain_core.output_parsers.openai_tools import (
     PydanticToolsParser,
 )
 from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
-from langchain_core.runnables import Runnable, RunnableMap, RunnablePassthrough
+from langchain_core.runnables import (
+    Runnable,
+    RunnableLambda,
+    RunnableMap,
+    RunnablePassthrough,
+)
 from langchain_core.tools import BaseTool
 from langchain_core.utils import (
     from_env,
@@ -122,6 +127,16 @@ class ModelBehavior(BaseModel):
             '[{"type": "thinking", "thinking": "..."}, '
             '{"type": "text", "text": "..."}]. '
             "Currently Qwen, GLM, GPT-OSS, and Kimi models expose this."
+        ),
+    )
+
+    use_json_object_for_structured_output: bool = Field(
+        default=False,
+        description=(
+            "When True, with_structured_output uses response_format json_object "
+            "instead of tool calling. Use for models that produce unreliable "
+            "structured output via tool calling. The model is prompted with the "
+            "schema and constrained to valid JSON output."
         ),
     )
 
@@ -194,7 +209,11 @@ MODEL_BEHAVIORS: Dict[str, ModelBehavior] = {
         unsupported_params=("max_tokens", "top_k", "repetition_penalty", "tool_choice"),
         supports_reasoning_content=True,
     ),
-    "gemma": _REASONING_BEHAVIOR,
+    "gemma": ModelBehavior(
+        embed_tool_calls_in_content=False,
+        supports_reasoning_content=True,
+        use_json_object_for_structured_output=True,
+    ),
     "gpt-oss": _REASONING_BEHAVIOR,
     "kimi": _REASONING_BEHAVIOR,
     "llama": ModelBehavior(embed_tool_calls_in_content=True),
@@ -1685,6 +1704,69 @@ class ChatCloudflareWorkersAI(BaseChatModel):
         # Handle special case for json_schema method
         if method == "json_schema":
             method = "function_calling"
+
+        # Some models produce unreliable structured output via tool calling.
+        # Use json_object mode instead: constrain to valid JSON and inject the
+        # schema into a system message so the model knows the expected structure.
+        if (
+            method == "function_calling"
+            and self._model_behavior.use_json_object_for_structured_output
+            and schema is not None
+        ):
+            if is_pydantic_schema:
+                raw_schema = schema.model_json_schema()  # type: ignore[union-attr]
+            else:
+                raw_schema = schema
+            schema_str = json.dumps(raw_schema, indent=2)
+            schema_system_msg = SystemMessage(
+                content=(
+                    "You must respond with valid JSON that matches this schema:\n"
+                    f"{schema_str}"
+                )
+            )
+
+            def _inject_schema_message(
+                messages: LanguageModelInput,
+            ) -> LanguageModelInput:
+                """Prepend schema system message, merging with existing system if present."""  # noqa: E501
+                if isinstance(messages, str):
+                    return [schema_system_msg, HumanMessage(content=messages)]
+                if isinstance(messages, list):
+                    if messages and isinstance(messages[0], SystemMessage):
+                        existing = messages[0].content
+                        prefix = existing if isinstance(existing, str) else ""
+                        merged = SystemMessage(
+                            content=prefix + "\n\n" + str(schema_system_msg.content)
+                        )
+                        return [merged] + messages[1:]
+                    return [schema_system_msg] + list(messages)
+                return messages
+
+            llm = self.bind(  # type: ignore[assignment]
+                response_format={"type": "json_object"},
+                ls_structured_output_format={
+                    "kwargs": {"method": "json_mode"},
+                    "schema": schema,
+                },
+            )
+            output_parser = (
+                CloudflarePydanticOutputParser(pydantic_object=schema)  # type: ignore
+                if is_pydantic_schema
+                else CloudflareJsonOutputParser()
+            )
+            pipeline = RunnableLambda(_inject_schema_message) | llm  # type: ignore[arg-type]
+            if include_raw:
+                parser_assign = RunnablePassthrough.assign(
+                    parsed=itemgetter("raw") | output_parser,  # type: ignore
+                    parsing_error=lambda _: None,
+                )
+                parser_none = RunnablePassthrough.assign(parsed=lambda _: None)
+                parser_with_fallback = parser_assign.with_fallbacks(
+                    [parser_none], exception_key="parsing_error"
+                )
+                return RunnableMap(raw=pipeline) | parser_with_fallback
+            else:
+                return pipeline | output_parser
 
         # Configure LLM and create appropriate parser based on method
         if method == "function_calling":
