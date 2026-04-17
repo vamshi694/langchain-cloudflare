@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## langchain-cloudflare
 
+### [0.3.3]
+
+#### Fixed
+
+- **Gemma structured output**: Gemma (`@cf/google/gemma-4-26b-a4b-it`) intermittently omitted required fields when using tool calling for `with_structured_output`. Switched to `json_object` response format with schema injected via system message for reliable output. Adds `use_json_object_for_structured_output` flag to `ModelBehavior` for future use with other models exhibiting the same behavior.
+
+---
+
 ### [0.3.2]
 
 #### Added
