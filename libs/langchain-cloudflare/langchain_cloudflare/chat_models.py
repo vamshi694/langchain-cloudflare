@@ -1688,8 +1688,14 @@ class ChatCloudflareWorkersAI(BaseChatModel):
         Args:
             schema: The output schema (OpenAI function/tool schema, JSON Schema,
                    TypedDict class, or Pydantic class)
-            method: Method for steering model generation
-            ("function_calling" or "json_mode")
+            method: Method for steering model generation. For models with
+                ``use_json_object_for_structured_output=True`` (e.g. Gemma),
+                ``"function_calling"`` (default) injects the schema as a system
+                message and uses ``response_format: json_object`` — reliable but
+                adds ~3x more input tokens than tool calling. Pass
+                ``"json_mode"`` to skip schema injection and use raw
+                ``json_object`` mode with fewer tokens (the model must infer
+                the schema from your prompt).
             include_raw: If True, return both raw and parsed responses
 
         Returns:
