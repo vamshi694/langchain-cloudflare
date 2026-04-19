@@ -1,6 +1,6 @@
 """Test CloudflareWorkersAI Chat API wrapper."""
 
-from typing import Any, Dict, List, Type
+from typing import Any, Dict, List, Optional, Type
 
 import pytest
 from langchain_core.language_models import BaseChatModel
@@ -11,7 +11,9 @@ from langchain_core.messages import (
     SystemMessage,
     ToolMessage,
 )
+from langchain_core.runnables import RunnableLambda, RunnableSequence
 from langchain_tests.unit_tests import ChatModelUnitTests
+from pydantic import BaseModel as PydanticBaseModel
 
 from langchain_cloudflare.chat_models import (
     ChatCloudflareWorkersAI,
@@ -723,3 +725,167 @@ class TestAIGatewayHeaders:
         )
         assert llm.client.headers["x-session-affinity"] == "session-456"
         assert llm.client.headers["cf-aig-request-timeout"] == "5000"
+
+
+# MARK: - with_structured_output Routing Tests
+
+
+class _Announcement(PydanticBaseModel):
+    title: str
+    summary: Optional[str] = None
+
+
+def _make_llm(model: str) -> ChatCloudflareWorkersAI:
+    return ChatCloudflareWorkersAI(
+        account_id="test_account",
+        api_token="test_token",
+        model=model,
+    )
+
+
+class TestWithStructuredOutputRouting:
+    """Unit tests for with_structured_output method routing.
+
+    All tests inspect the returned Runnable pipeline without calling the API.
+    """
+
+    # MARK: - json_schema method
+
+    def test_json_schema_method_injects_schema_system_message(self):
+        """method='json_schema' should prepend a schema system message."""
+        llm = _make_llm("@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+        chain = llm.with_structured_output(_Announcement, method="json_schema")
+
+        assert isinstance(chain, RunnableSequence)
+        # First step must be the schema-injection lambda
+        assert isinstance(chain.first, RunnableLambda)
+
+        # Invoke the lambda with a plain string and confirm schema is injected
+        result = chain.first.invoke("tell me something")
+        assert isinstance(result, list)
+        assert isinstance(result[0], SystemMessage)
+        assert "title" in result[0].content
+
+    def test_json_schema_method_sets_json_object_response_format(self):
+        """method='json_schema' on llama should bind response_format=json_object."""
+        llm = _make_llm("@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+        chain = llm.with_structured_output(_Announcement, method="json_schema")
+
+        # pipeline is: RunnableLambda | bound_llm | output_parser
+        # bound_llm is chain.steps[1]
+        bound_llm = chain.steps[1]
+        assert bound_llm.kwargs.get("response_format") == {"type": "json_object"}
+
+    def test_json_schema_method_merges_existing_system_message(self):
+        """Schema system message should merge with an existing system message."""
+        llm = _make_llm("@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+        chain = llm.with_structured_output(_Announcement, method="json_schema")
+        inject = chain.first.func
+
+        messages = [SystemMessage(content="Be concise."), HumanMessage(content="hi")]
+        result = inject(messages)
+
+        assert isinstance(result[0], SystemMessage)
+        assert "Be concise." in result[0].content
+        assert "title" in result[0].content
+
+    def test_json_schema_method_works_on_gemma(self):
+        """Explicit method='json_schema' on Gemma should follow same path."""
+        llm = _make_llm("@cf/google/gemma-4-26b-a4b-it")
+        chain = llm.with_structured_output(_Announcement, method="json_schema")
+
+        assert isinstance(chain.first, RunnableLambda)
+        bound_llm = chain.steps[1]
+        assert bound_llm.kwargs.get("response_format") == {"type": "json_object"}
+
+    # MARK: - Gemma auto-routing
+
+    def test_gemma_function_calling_auto_routes_to_json_schema(self):
+        """Gemma with method='function_calling' should auto-route to json_schema."""
+        llm = _make_llm("@cf/google/gemma-4-26b-a4b-it")
+        chain = llm.with_structured_output(_Announcement)
+
+        # Same pipeline shape as json_schema: starts with injection lambda
+        assert isinstance(chain.first, RunnableLambda)
+        bound_llm = chain.steps[1]
+        assert bound_llm.kwargs.get("response_format") == {"type": "json_object"}
+
+    # MARK: - function_calling method (non-Gemma)
+
+    def test_function_calling_on_llama_uses_tool_calling(self):
+        """Default method='function_calling' on llama should NOT inject schema."""
+        llm = _make_llm("@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+        chain = llm.with_structured_output(_Announcement)
+
+        # Pipeline is: bound_llm | output_parser — no injection lambda
+        assert not isinstance(chain.first, RunnableLambda)
+
+    def test_function_calling_raises_without_schema(self):
+        """method='function_calling' with schema=None should raise ValueError."""
+        llm = _make_llm("@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+        with pytest.raises(ValueError, match="schema must be specified"):
+            llm.with_structured_output(None, method="function_calling")
+
+    # MARK: - json_mode method
+
+    def test_json_mode_sets_json_object_without_injection(self):
+        """method='json_mode' should set json_object but NOT inject a schema message."""
+        llm = _make_llm("@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+        chain = llm.with_structured_output(_Announcement, method="json_mode")
+
+        # Pipeline is: bound_llm | output_parser — no injection lambda
+        assert not isinstance(chain.first, RunnableLambda)
+        assert chain.first.kwargs.get("response_format") == {"type": "json_object"}
+
+    # MARK: - Mistral guided_json mode
+
+    def test_mistral_json_schema_uses_json_object_with_injection(self):
+        """method='json_schema' on Mistral uses json_object + system message injection.
+
+        Mistral's Workers AI doesn't support complex schemas in guided_json, so we
+        fall back to json_object: constrain to valid JSON and inject the schema via
+        a system message prompt.
+        """
+        llm = _make_llm("@cf/mistralai/mistral-small-3.1-24b-instruct")
+        chain = llm.with_structured_output(_Announcement, method="json_schema")
+
+        # json_object path: starts with injection lambda (same as llama/gemma)
+        assert isinstance(chain.first, RunnableLambda)
+        bound_llm = chain.steps[1]
+        assert bound_llm.kwargs.get("response_format") == {"type": "json_object"}
+
+    def test_mistral_auto_routing_uses_tool_calling(self):
+        """Mistral with method='function_calling' should still use tool calling."""
+        llm = _make_llm("@cf/mistralai/mistral-small-3.1-24b-instruct")
+        chain = llm.with_structured_output(_Announcement)
+
+        assert not isinstance(chain.first, RunnableLambda)
+        assert "guided_json" not in chain.first.kwargs
+
+    # MARK: - gpt-oss json_schema_rf mode
+
+    def test_gpt_oss_json_schema_uses_json_schema_rf(self):
+        """method='json_schema' on gpt-oss should bind response_format=json_schema."""
+        llm = _make_llm("@cf/openai/gpt-oss-120b")
+        chain = llm.with_structured_output(_Announcement, method="json_schema")
+
+        assert not isinstance(chain.first, RunnableLambda)
+        rf = chain.first.kwargs.get("response_format", {})
+        assert rf.get("type") == "json_schema"
+        assert "title" in rf.get("json_schema", {})
+
+    def test_gpt_oss_auto_routing_uses_tool_calling(self):
+        """gpt-oss with default method='function_calling' should use tool calling."""
+        llm = _make_llm("@cf/openai/gpt-oss-120b")
+        chain = llm.with_structured_output(_Announcement)
+
+        assert not isinstance(chain.first, RunnableLambda)
+        assert "response_format" not in chain.first.kwargs
+
+    # MARK: - invalid method
+
+    def test_invalid_method_raises(self):
+        """Unknown method value should raise ValueError."""
+        llm = _make_llm("@cf/meta/llama-3.3-70b-instruct-fp8-fast")
+        with pytest.raises(ValueError, match="Unrecognized method argument"):
+            llm.with_structured_output(_Announcement, method="bad_method")  # type: ignore[arg-type]

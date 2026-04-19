@@ -140,6 +140,19 @@ class ModelBehavior(BaseModel):
         ),
     )
 
+    json_schema_mode: Literal["json_object", "guided_json", "json_schema_rf"] = Field(
+        default="json_object",
+        description=(
+            "How to implement method='json_schema' for this model family. "
+            "'json_object': bind response_format=json_object and inject schema "
+            "into a system message (default, works for most models). "
+            "'guided_json': bind guided_json=<schema> directly, no injection "
+            "(Mistral). "
+            "'json_schema_rf': bind response_format={type: json_schema, "
+            "json_schema: <schema>}, no injection (GPT-OSS / OpenAI-compatible)."
+        ),
+    )
+
 
 def _transform_response_format_to_guided_json(
     params: Dict[str, Any],
@@ -214,13 +227,18 @@ MODEL_BEHAVIORS: Dict[str, ModelBehavior] = {
         supports_reasoning_content=True,
         use_json_object_for_structured_output=True,
     ),
-    "gpt-oss": _REASONING_BEHAVIOR,
+    "gpt-oss": ModelBehavior(
+        embed_tool_calls_in_content=False,
+        supports_reasoning_content=True,
+        json_schema_mode="json_schema_rf",
+    ),
     "kimi": _REASONING_BEHAVIOR,
     "llama": ModelBehavior(embed_tool_calls_in_content=True),
     "mistral": ModelBehavior(
         embed_tool_calls_in_content=False,
         unsupported_params=("tool_choice",),
         response_format_param="guided_json",
+        json_schema_mode="json_object",
     ),
     "nemotron": _REASONING_BEHAVIOR,
     "qwen": _REASONING_BEHAVIOR,
@@ -1679,7 +1697,9 @@ class ChatCloudflareWorkersAI(BaseChatModel):
         self,
         schema: Optional[Union[Dict, Type[BaseModel]]] = None,
         *,
-        method: Literal["function_calling", "json_mode"] = "function_calling",
+        method: Literal[
+            "function_calling", "json_mode", "json_schema"
+        ] = "function_calling",
         include_raw: bool = False,
         **kwargs: Any,
     ) -> Runnable[LanguageModelInput, Union[Dict, BaseModel]]:
@@ -1688,14 +1708,20 @@ class ChatCloudflareWorkersAI(BaseChatModel):
         Args:
             schema: The output schema (OpenAI function/tool schema, JSON Schema,
                    TypedDict class, or Pydantic class)
-            method: Method for steering model generation. For models with
-                ``use_json_object_for_structured_output=True`` (e.g. Gemma),
-                ``"function_calling"`` (default) injects the schema as a system
-                message and uses ``response_format: json_object`` — reliable but
-                adds ~3x more input tokens than tool calling. Pass
-                ``"json_mode"`` to skip schema injection and use raw
-                ``json_object`` mode with fewer tokens (the model must infer
-                the schema from your prompt).
+            method: Method for steering model generation.
+
+                - ``"function_calling"`` (default): Use tool calling. For models
+                  that produce unreliable structured output via tool calling (e.g.
+                  Gemma), this automatically falls back to ``"json_schema"``
+                  behavior.
+                - ``"json_schema"``: Constrain output to valid JSON and inject the
+                  schema into a system message. Reliable across models but adds
+                  ~3x more input tokens than tool calling. Available for any model
+                  — useful when tool calling is unreliable or unsupported.
+                - ``"json_mode"``: Use ``response_format: json_object`` without
+                  schema injection. The model infers the structure from your
+                  prompt. Fewest tokens, but least constrained.
+
             include_raw: If True, return both raw and parsed responses
 
         Returns:
@@ -1707,60 +1733,88 @@ class ChatCloudflareWorkersAI(BaseChatModel):
 
         is_pydantic_schema = _is_pydantic_class(schema)
 
-        # Handle special case for json_schema method
-        if method == "json_schema":
-            method = "function_calling"
-
-        # Some models produce unreliable structured output via tool calling.
-        # Use json_object mode instead: constrain to valid JSON and inject the
-        # schema into a system message so the model knows the expected structure.
-        if (
+        # json_schema: constrain output to valid JSON using the model's native
+        # mechanism. Triggered explicitly via method="json_schema", or
+        # automatically for models that produce unreliable tool-call structured
+        # output (use_json_object_for_structured_output=True).
+        use_json_schema_path = method == "json_schema" or (
             method == "function_calling"
             and self._model_behavior.use_json_object_for_structured_output
-            and schema is not None
-        ):
+        )
+        if use_json_schema_path and schema is not None:
             if is_pydantic_schema:
                 raw_schema = schema.model_json_schema()  # type: ignore[union-attr]
             else:
                 raw_schema = schema
-            schema_str = json.dumps(raw_schema, indent=2)
-            schema_system_msg = SystemMessage(
-                content=(
-                    "You must respond with valid JSON that matches this schema:\n"
-                    f"{schema_str}"
-                )
-            )
 
-            def _inject_schema_message(
-                messages: LanguageModelInput,
-            ) -> LanguageModelInput:
-                """Prepend schema system message, merging with existing system if present."""  # noqa: E501
-                if isinstance(messages, str):
-                    return [schema_system_msg, HumanMessage(content=messages)]
-                if isinstance(messages, list):
-                    if messages and isinstance(messages[0], SystemMessage):
-                        existing = messages[0].content
-                        prefix = existing if isinstance(existing, str) else ""
-                        merged = SystemMessage(
-                            content=prefix + "\n\n" + str(schema_system_msg.content)
-                        )
-                        return [merged] + messages[1:]
-                    return [schema_system_msg] + list(messages)
-                return messages
-
-            llm = self.bind(  # type: ignore[assignment]
-                response_format={"type": "json_object"},
-                ls_structured_output_format={
-                    "kwargs": {"method": "json_mode"},
-                    "schema": schema,
-                },
-            )
+            json_schema_mode = self._model_behavior.json_schema_mode
             output_parser = (
                 CloudflarePydanticOutputParser(pydantic_object=schema)  # type: ignore
                 if is_pydantic_schema
                 else CloudflareJsonOutputParser()
             )
-            pipeline = RunnableLambda(_inject_schema_message) | llm  # type: ignore[arg-type]
+
+            if json_schema_mode == "guided_json":
+                # Mistral: bind guided_json=<schema> directly; constrained
+                # decoding handles schema adherence without system message injection.
+                llm = self.bind(  # type: ignore[assignment]
+                    guided_json=raw_schema,
+                    ls_structured_output_format={
+                        "kwargs": {"method": "json_schema"},
+                        "schema": schema,
+                    },
+                )
+                pipeline: Any = llm
+
+            elif json_schema_mode == "json_schema_rf":
+                # GPT-OSS / OpenAI-compatible: use response_format json_schema,
+                # which Cloudflare normalizes correctly. No injection needed.
+                llm = self.bind(  # type: ignore[assignment]
+                    response_format={"type": "json_schema", "json_schema": raw_schema},
+                    ls_structured_output_format={
+                        "kwargs": {"method": "json_schema"},
+                        "schema": schema,
+                    },
+                )
+                pipeline = llm
+
+            else:
+                # Default (json_object): constrain to valid JSON and inject the
+                # schema into a system message so the model knows the structure.
+                schema_str = json.dumps(raw_schema, indent=2)
+                schema_system_msg = SystemMessage(
+                    content=(
+                        "You must respond with valid JSON that matches this schema:\n"
+                        f"{schema_str}"
+                    )
+                )
+
+                def _inject_schema_message(
+                    messages: LanguageModelInput,
+                ) -> LanguageModelInput:
+                    """Prepend schema system message, merging with existing system if present."""  # noqa: E501
+                    if isinstance(messages, str):
+                        return [schema_system_msg, HumanMessage(content=messages)]
+                    if isinstance(messages, list):
+                        if messages and isinstance(messages[0], SystemMessage):
+                            existing = messages[0].content
+                            prefix = existing if isinstance(existing, str) else ""
+                            merged = SystemMessage(
+                                content=prefix + "\n\n" + str(schema_system_msg.content)
+                            )
+                            return [merged] + messages[1:]
+                        return [schema_system_msg] + list(messages)
+                    return messages
+
+                llm = self.bind(  # type: ignore[assignment]
+                    response_format={"type": "json_object"},
+                    ls_structured_output_format={
+                        "kwargs": {"method": "json_mode"},
+                        "schema": schema,
+                    },
+                )
+                pipeline = RunnableLambda(_inject_schema_message) | llm  # type: ignore[arg-type]
+
             if include_raw:
                 parser_assign = RunnablePassthrough.assign(
                     parsed=itemgetter("raw") | output_parser,  # type: ignore
@@ -1819,8 +1873,8 @@ class ChatCloudflareWorkersAI(BaseChatModel):
 
         else:
             raise ValueError(
-                f"Unrecognized method argument. Expected one of 'function_calling' or "
-                f"'json_mode'. Received: '{method}'"
+                f"Unrecognized method argument. Expected one of 'function_calling', "
+                f"'json_mode', or 'json_schema'. Received: '{method}'"
             )
 
         # Configure final output structure based on include_raw flag
