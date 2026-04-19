@@ -233,6 +233,16 @@ MODEL_BEHAVIORS: Dict[str, ModelBehavior] = {
         json_schema_mode="json_schema_rf",
     ),
     "kimi": _REASONING_BEHAVIOR,
+    # Specific llama variants before the general "llama" entry (first-match wins).
+    # These models return unreliable structured output via tool calling.
+    "llama-4-scout": ModelBehavior(
+        embed_tool_calls_in_content=True,
+        use_json_object_for_structured_output=True,
+    ),
+    "llama-3.2-11b-vision": ModelBehavior(
+        embed_tool_calls_in_content=True,
+        use_json_object_for_structured_output=True,
+    ),
     "llama": ModelBehavior(embed_tool_calls_in_content=True),
     "mistral": ModelBehavior(
         embed_tool_calls_in_content=False,
@@ -1296,11 +1306,18 @@ class ChatCloudflareWorkersAI(BaseChatModel):
             choice = response_result["choices"][0]
             message_data = choice.get("message", {})
             content = message_data.get("content", "")
+            # Some models return content as a parsed dict (e.g. json_object mode).
+            # Normalise to a JSON string so AIMessage validation always succeeds.
+            if isinstance(content, dict):
+                content = json.dumps(content)
             # Token usage in OpenAI format is at the top level of result
             token_usage = response_result.get("usage", {})
         else:
             # Old Workers AI format
             content = response_result.get("response", "")
+            # Same normalisation as the choices path above.
+            if isinstance(content, dict):
+                content = json.dumps(content)
             token_usage = response_result.get("usage", {})
             message_data = {}  # No message data in old format
         tool_calls = []
@@ -1456,9 +1473,11 @@ class ChatCloudflareWorkersAI(BaseChatModel):
                 content_blocks.append({"type": "text", "text": content})
             message = AIMessage(content=content_blocks)
         else:
-            # Use empty string if content is None
+            # Use empty string if content is None; normalise dict to JSON string
             if content is None:
                 content = ""
+            elif isinstance(content, dict):
+                content = json.dumps(content)
             message = AIMessage(
                 content=content,
             )
